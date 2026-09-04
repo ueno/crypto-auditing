@@ -3,6 +3,7 @@
 
 use crate::types::{Context, ContextId, Event, EventGroup};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sysinfo::System;
@@ -12,6 +13,8 @@ use tracing::info;
 pub struct ContextTracker {
     all_contexts: Vec<Rc<RefCell<Context>>>,
     root_contexts: Vec<Rc<RefCell<Context>>>,
+    larval_contexts: HashMap<ContextId, Rc<RefCell<Context>>>,
+    parents: HashMap<ContextId, ContextId>,
     boot_time: SystemTime,
 }
 
@@ -20,6 +23,8 @@ impl ContextTracker {
         Self {
             all_contexts: Vec::new(),
             root_contexts: Vec::new(),
+            larval_contexts: HashMap::new(),
+            parents: HashMap::new(),
             boot_time: boot_time.unwrap_or_else(|| {
                 UNIX_EPOCH
                     .checked_add(Duration::from_secs(System::boot_time()))
@@ -45,6 +50,24 @@ impl ContextTracker {
             .map(|context| Rc::into_inner(context).unwrap().into_inner())
     }
 
+    fn push_orphaned_context(&mut self, id: &ContextId, start: SystemTime, end: SystemTime) {
+        let context = Rc::new(RefCell::new(Context {
+            id: *id,
+            start,
+            end,
+            ..Default::default()
+        }));
+        self.root_contexts.push(context.clone());
+        self.all_contexts.push(context);
+    }
+
+    fn last_context(&self, id: &ContextId) -> Option<&Rc<RefCell<Context>>> {
+        self.all_contexts
+            .iter()
+            .rev()
+            .find(|context| context.borrow().id == *id)
+    }
+
     fn resolve_system_time(&self, time: Duration) -> SystemTime {
         self.boot_time.checked_add(time).unwrap_or(UNIX_EPOCH)
     }
@@ -63,7 +86,7 @@ impl ContextTracker {
                 origin,
                 executable,
             } => {
-                let context = Rc::new(RefCell::new(Context {
+                let larval_context = Rc::new(RefCell::new(Context {
                     id: *id,
                     origin: origin.to_owned(),
                     executable: executable.to_owned(),
@@ -71,46 +94,41 @@ impl ContextTracker {
                     end,
                     ..Default::default()
                 }));
-                if let Some(parent) = self
-                    .all_contexts
-                    .iter()
-                    .rev()
-                    .find(|x| x.borrow().id == parent_context[..])
-                {
-                    parent.borrow_mut().spans.push(context.clone());
-                    self.all_contexts.push(context);
-                    Ok(false)
+                self.larval_contexts.insert(*id, larval_context);
+                self.parents.insert(*id, *parent_context);
+                Ok(false)
+            }
+            Event::Data { key, value } if key == "name" => {
+                if let Some(larval_context) = self.larval_contexts.remove(id) {
+                    larval_context
+                        .borrow_mut()
+                        .events
+                        .insert(key.to_string(), value.clone());
+                    if let Some(parent_context) = self.parents.remove(id)
+                        && let Some(parent) = self.last_context(&parent_context)
+                    {
+                        parent.borrow_mut().spans.push(larval_context.clone());
+                        self.all_contexts.push(larval_context);
+                        Ok(false)
+                    } else {
+                        self.root_contexts.push(larval_context.clone());
+                        self.all_contexts.push(larval_context);
+                        Ok(true)
+                    }
                 } else {
-                    self.root_contexts.push(context.clone());
-                    self.all_contexts.push(context);
+                    self.push_orphaned_context(id, start, end);
                     Ok(true)
                 }
             }
             Event::Data { key, value } => {
-                if let Some(parent) = self
-                    .all_contexts
-                    .iter()
-                    .rev()
-                    .find(|x| x.borrow().id == *id)
-                {
-                    parent
+                if let Some(context) = self.last_context(id) {
+                    context
                         .borrow_mut()
                         .events
                         .insert(key.to_string(), value.clone());
                     Ok(false)
                 } else {
-                    // Either this library did not do a new_context for this context, or the
-                    // log we have is truncated at the beginning. Just assume that this context
-                    // has no parent and create a new one so we don't lose the information in
-                    // this message.
-                    let context_obj = Rc::new(RefCell::new(Context {
-                        id: *id,
-                        start,
-                        end,
-                        ..Default::default()
-                    }));
-                    self.root_contexts.push(context_obj.clone());
-                    self.all_contexts.push(context_obj);
+                    self.push_orphaned_context(id, start, end);
                     Ok(true)
                 }
             }
